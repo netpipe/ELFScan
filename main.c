@@ -5,6 +5,7 @@
  *
  * Detects:
  *   - x86/x86-64 NOP sleds in executable ELF regions
+ *   - runs of single-byte instructions that slide (REX prefixes, "AAAA")
  *   - Some possible NOP-sled generation routines using REP STOS*
  *   - W+X segments and executable stacks as risk markers
  *
@@ -17,7 +18,7 @@
  *   gcc -O2 -Wall -Wextra -o elfscan elfscan.c
  *
  * Usage:
- *   ./elfscan [-t min_sled] [-w gen_window] [-a] [-G] [-v] file...
+ *   ./elfscan [-t min_sled] [-s min_slide] [-w gen_window] [-a] [-G] [-v] file...
  *
  * Exit codes:
  *   0 = no findings
@@ -192,13 +193,16 @@ typedef struct {
 
 #define DEFAULT_MIN_SLED 32
 #define DEFAULT_GEN_WINDOW 96
+#define DEFAULT_MIN_SEMANTIC 64
 
 typedef struct {
     int min_sled;       /* minimum NOP run length in bytes */
+    int min_semantic;   /* minimum single-byte-slide run length, 0 disables */
     int gen_window;     /* backward search window for generator heuristics */
     int scan_all;       /* scan raw file if no ELF executable regions found / non-ELF */
     int extra_gen;      /* enable noisier memset/call heuristic */
     int verbose;
+    int is64;           /* set per file; decides which bytes can slide */
 } Options;
 
 static int range_ok(uint64_t off, uint64_t len, uint64_t total) {
@@ -224,62 +228,137 @@ static size_t find_bytes(const uint8_t *hay, size_t haylen,
  *
  * This intentionally focuses on common NOP forms used in sleds and
  * compiler padding. It is not a full x86 disassembler.
+ *
+ * Prefixes are counted first and separately.  Writing the encodings out
+ * as fixed byte strings missed every prefixed form, and those are the
+ * ones a compiler emits most: /usr/bin/python3 contains 1445 copies of
+ * 66 66 2e 0f 1f 84 00 00 00 00 00.  A 440-byte block of them used to be
+ * reported as forty separate eight-byte runs, because the 0f 1f 84 in the
+ * middle matched and the 66 66 2e in front broke the run every time - so
+ * the block never reached the sled threshold at all.
+ *
+ * Legal prefixes on a NOP:
+ *   66       operand size, repeatable
+ *   2e 3e 26 36 64 65   segment override (gas uses %cs = 2e for padding)
+ *   40-4f    REX, at most one and it must be last
+ * The instruction itself is 90, or 0f 1f /0 with a ModRM+SIB+disp.
  */
+static int is_nop_prefix(uint8_t b) {
+    return b == 0x66 || b == 0x2E || b == 0x3E ||
+           b == 0x26 || b == 0x36 || b == 0x64 || b == 0x65;
+}
+
+/* length of the 0f 1f form's ModRM + SIB + displacement, or 0 if not one */
+static size_t nop_modrm_len(const uint8_t *p, size_t n) {
+    if (n < 1) return 0;
+
+    uint8_t modrm = p[0];
+    uint8_t mod = (uint8_t)(modrm >> 6);
+    uint8_t rm = (uint8_t)(modrm & 7);
+
+    /* only /0 is the hint NOP */
+    if (((modrm >> 3) & 7) != 0) return 0;
+
+    size_t len = 1;
+
+    if (mod != 3 && rm == 4) {          /* SIB byte follows */
+        if (n < len + 1) return 0;
+        len++;
+    }
+
+    if (mod == 1) {
+        if (n < len + 1) return 0;
+        len += 1;                        /* disp8 */
+    } else if (mod == 2) {
+        if (n < len + 4) return 0;
+        len += 4;                        /* disp32 */
+    } else if (mod == 0 && rm == 5) {
+        if (n < len + 4) return 0;
+        len += 4;                        /* rip-relative disp32 */
+    }
+
+    return len;
+}
+
 static size_t match_nop(const uint8_t *p, size_t n) {
-    /* nop */
-    if (n >= 1 && p[0] == 0x90) {
-        return 1;
+    size_t i = 0;
+    int rex = 0;      /* the REX byte itself, or 0 */
+
+    /* an x86 instruction is at most 15 bytes including prefixes */
+    while (i < n && i < 14) {
+        if (is_nop_prefix(p[i])) {
+            if (rex) break;              /* REX must be the last prefix */
+            i++;
+            continue;
+        }
+
+        if (p[i] >= 0x40 && p[i] <= 0x4F) {
+            if (rex) break;
+            rex = p[i];
+            i++;
+            continue;
+        }
+
+        break;
     }
 
-    /* xchg ax, ax / 66 nop */
-    if (n >= 2 && p[0] == 0x66 && p[1] == 0x90) {
-        return 2;
+    if (i >= n) return 0;
+
+    /*
+     * 90 is a NOP only while REX.B is clear: 48 90 is nop, but 41 90 is
+     * REX.B + 90 = xchg r8d,eax, which is a real instruction.
+     */
+    if (p[i] == 0x90) {
+        if (rex && (rex & 1)) return 0;
+        return i + 1;
     }
 
-    /* common multi-byte NOPs */
-    if (n >= 3 && p[0] == 0x0F && p[1] == 0x1F && p[2] == 0x00) {
-        return 3;
-    }
+    /* 0f 1f /0 - the multi-byte hint NOP */
+    if (i + 1 < n && p[i] == 0x0F && p[i + 1] == 0x1F) {
+        size_t m = nop_modrm_len(p + i + 2, n - i - 2);
+        if (m == 0) return 0;
 
-    if (n >= 4 &&
-        p[0] == 0x0F && p[1] == 0x1F &&
-        p[2] == 0x40 && p[3] == 0x00) {
-        return 4;
-    }
-
-    if (n >= 5 &&
-        p[0] == 0x0F && p[1] == 0x1F &&
-        p[2] == 0x44 && p[3] == 0x00 && p[4] == 0x00) {
-        return 5;
-    }
-
-    if (n >= 6 &&
-        p[0] == 0x66 && p[1] == 0x0F && p[2] == 0x1F &&
-        p[3] == 0x44 && p[4] == 0x00 && p[5] == 0x00) {
-        return 6;
-    }
-
-    if (n >= 7 &&
-        p[0] == 0x0F && p[1] == 0x1F && p[2] == 0x80 &&
-        p[3] == 0x00 && p[4] == 0x00 && p[5] == 0x00 && p[6] == 0x00) {
-        return 7;
-    }
-
-    if (n >= 8 &&
-        p[0] == 0x0F && p[1] == 0x1F &&
-        p[2] == 0x84 && p[3] == 0x00 &&
-        p[4] == 0x00 && p[5] == 0x00 && p[6] == 0x00 && p[7] == 0x00) {
-        return 8;
-    }
-
-    if (n >= 9 &&
-        p[0] == 0x66 && p[1] == 0x0F && p[2] == 0x1F &&
-        p[3] == 0x84 && p[4] == 0x00 &&
-        p[5] == 0x00 && p[6] == 0x00 && p[7] == 0x00 && p[8] == 0x00) {
-        return 9;
+        size_t total = i + 2 + m;
+        if (total > 15) return 0;
+        return total;
     }
 
     return 0;
+}
+
+/*
+ * A sled does not have to be built from NOPs.  Any single-byte
+ * instruction that leaves the machine usable will slide, and the classic
+ * one is 0x41 - "AAAA" in a string, and in 64-bit mode a REX prefix, so
+ * every byte of the run is a valid landing point.  A 300-byte run of it
+ * used to be completely invisible.
+ *
+ * These are reported separately from real NOP runs, because their false
+ * positive profile is different: 0x00 padding and ASCII runs are
+ * everywhere in a binary, so this needs its own threshold.
+ */
+static int semantic_nop_byte(uint8_t b, int is64) {
+    if (b == 0x90) return 1;
+    if (b >= 0x40 && b <= 0x4F) return 1;   /* REX in 64-bit, inc/dec in 32-bit */
+    if (b == 0x97 || b == 0x98 || b == 0x99) return 1;
+    if (b == 0xF8 || b == 0xF9 || b == 0xFC) return 1;
+
+    /* daa/das/aaa/aas are invalid opcodes in long mode, so they cannot
+       slide there - only count them for a 32-bit object */
+    if (!is64 && (b == 0x27 || b == 0x2F || b == 0x37 || b == 0x3F)) return 1;
+
+    return 0;
+}
+
+static const char *semantic_nop_name(uint8_t b) {
+    if (b >= 0x40 && b <= 0x4F) return "REX prefix";
+    if (b == 0x90) return "nop";
+    if (b == 0x97) return "xchg eax,edi";
+    if (b == 0x27 || b == 0x2F || b == 0x37 || b == 0x3F) return "bcd adjust (32-bit)";
+    if (b == 0xF8 || b == 0xF9) return "clc/stc";
+    if (b == 0xFC) return "cld";
+    if (b == 0x98 || b == 0x99) return "cwde/cdq";
+    return NULL;
 }
 
 static const char *severity_sled(size_t len) {
@@ -327,6 +406,84 @@ static void scan_nops(const uint8_t *buf, size_t len,
         if (run == 0) {
             i++;
         }
+    }
+}
+
+/*
+ * A run of single-byte instructions that all slide.  Reported separately
+ * from real NOP runs because the false-positive profile is different -
+ * ASCII text and padding inside an executable segment can look like this,
+ * so it carries its own threshold.
+ */
+static void scan_semantic(const uint8_t *buf, size_t len,
+                          uint64_t vbase, uint64_t fbase,
+                          const char *region, const char *path,
+                          const Options *opt, int *findings) {
+    if (opt->min_semantic <= 0) return;
+
+    size_t i = 0;
+
+    while (i < len) {
+        if (!semantic_nop_byte(buf[i], opt->is64)) {
+            i++;
+            continue;
+        }
+
+        size_t start = i;
+        int seen[256];
+        memset(seen, 0, sizeof(seen));
+
+        while (i < len && semantic_nop_byte(buf[i], opt->is64)) {
+            seen[buf[i]] = 1;
+            i++;
+        }
+
+        size_t run = i - start;
+        if (run < (size_t)opt->min_semantic) continue;
+
+        /*
+         * If the whole run decodes as NOP instructions then scan_nops has
+         * already reported it and this would be a second finding for the
+         * same bytes.  Checking that the decode covers the run exactly is
+         * better than checking for 0x90, because 48 90 (rex.w nop) is a
+         * NOP whose bytes are both in the slide set.
+         */
+        size_t k = start;
+        while (k < i) {
+            size_t l = match_nop(buf + k, i - k);
+            if (!l) break;
+            k += l;
+        }
+        if (k >= i) continue;
+
+        int distinct = 0;
+        uint8_t dominant = buf[start];
+        size_t best = 0;
+
+        for (int b = 0; b < 256; b++) {
+            if (!seen[b]) continue;
+            distinct++;
+
+            size_t c = 0;
+            for (size_t k = start; k < i; k++) if (buf[k] == (uint8_t)b) c++;
+            if (c > best) { best = c; dominant = (uint8_t)b; }
+        }
+
+        const char *name = semantic_nop_name(dominant);
+
+        printf("[SLIDE_RUN] file=%s region=%s vaddr=0x%llx fileoff=0x%llx "
+               "len=%zu distinct=%d dominant=0x%02x (%s) severity=%s\n",
+               path,
+               region,
+               (unsigned long long)(vbase + start),
+               (unsigned long long)(fbase + start),
+               run,
+               distinct,
+               (unsigned)dominant,
+               name ? name : "?",
+               severity_sled(run));
+
+        (*findings)++;
     }
 }
 
@@ -385,7 +542,38 @@ static void scan_generators(const uint8_t *buf, size_t len,
     size_t window = (size_t)opt->gen_window;
 
     for (size_t i = 0; i < len; ) {
-        if (buf[i] != 0xF3) {
+        /*
+         * Prefixes may appear in any order, and the assembler does not
+         * use the order this code originally assumed: "rep stosw" is
+         * 66 F3 AB, not F3 66 AB.  Matching fixed byte strings meant
+         * klass 3 never fired, so pat_ax_90 and pat_ax_9090 were written
+         * but never reached, and a mov ax,0x9090 + rep stosw generator
+         * was reported as no findings at all.
+         *
+         * Collect the prefixes first instead, then look at the opcode.
+         */
+        if (buf[i] != 0xF3 && buf[i] != 0x66 && !(buf[i] >= 0x40 && buf[i] <= 0x4F)) {
+            i++;
+            continue;
+        }
+
+        size_t j = i;
+        int have_rep = 0;
+        int have_66 = 0;
+        int rexw = 0;
+
+        while (j < len && j - i < 4) {
+            if (buf[j] == 0xF3) { have_rep = 1; j++; continue; }
+            if (buf[j] == 0x66) { have_66 = 1; j++; continue; }
+            if (buf[j] >= 0x40 && buf[j] <= 0x4F) {
+                if (buf[j] & 0x08) rexw = 1;
+                j++;
+                continue;
+            }
+            break;
+        }
+
+        if (!have_rep || j >= len) {
             i++;
             continue;
         }
@@ -394,22 +582,15 @@ static void scan_generators(const uint8_t *buf, size_t len,
         size_t ilen = 0;
         int klass = 0;
 
-        if (i + 2 <= len && buf[i + 1] == 0xAA) {
+        if (buf[j] == 0xAA) {
             what = "rep stosb";
-            ilen = 2;
+            ilen = j + 1 - i;
             klass = 1;
-        } else if (i + 2 <= len && buf[i + 1] == 0xAB) {
-            what = "rep stosd";
-            ilen = 2;
-            klass = 2;
-        } else if (i + 3 <= len && buf[i + 1] == 0x66 && buf[i + 2] == 0xAB) {
-            what = "rep stosw";
-            ilen = 3;
-            klass = 3;
-        } else if (i + 3 <= len && buf[i + 1] == 0x48 && buf[i + 2] == 0xAB) {
-            what = "rep stosq";
-            ilen = 3;
-            klass = 4;
+        } else if (buf[j] == 0xAB) {
+            if (rexw) { what = "rep stosq"; klass = 4; }
+            else if (have_66) { what = "rep stosw"; klass = 3; }
+            else { what = "rep stosd"; klass = 2; }
+            ilen = j + 1 - i;
         }
 
         if (!what) {
@@ -462,6 +643,9 @@ static void scan_generators(const uint8_t *buf, size_t len,
             } else if (find_bytes(wb, wlen, pat_eax_90, sizeof(pat_eax_90)) != SIZE_MAX) {
                 found = 1;
                 imm = "mov eax,0x90";
+            } else if (find_bytes(wb, wlen, pat_eax_90909090, sizeof(pat_eax_90909090)) != SIZE_MAX) {
+                found = 1;
+                imm = "mov eax,0x90909090";
             }
         } else if (klass == 4) {
             if (find_bytes(wb, wlen, pat_rax_90_imm32, sizeof(pat_rax_90_imm32)) != SIZE_MAX) {
@@ -600,6 +784,7 @@ static void scan_region(const uint8_t *data,
     }
 
     scan_nops(buf, sz, vaddr, fileoff, region, path, opt, findings);
+    scan_semantic(buf, sz, vaddr, fileoff, region, path, opt, findings);
     scan_generators(buf, sz, vaddr, fileoff, region, path, opt, findings);
 
     if (opt->extra_gen) {
@@ -608,7 +793,11 @@ static void scan_region(const uint8_t *data,
 }
 
 static int scan_elf64(const uint8_t *data, size_t size,
-                      const char *path, const Options *opt) {
+                      const char *path, const Options *in_opt) {
+    Options opt_store = *in_opt;
+    opt_store.is64 = 1;
+    const Options *opt = &opt_store;
+
     int findings = 0;
     int scanned = 0;
 
@@ -760,7 +949,11 @@ static int scan_elf64(const uint8_t *data, size_t size,
 }
 
 static int scan_elf32(const uint8_t *data, size_t size,
-                      const char *path, const Options *opt) {
+                      const char *path, const Options *in_opt) {
+    Options opt_store = *in_opt;
+    opt_store.is64 = 0;
+    const Options *opt = &opt_store;
+
     int findings = 0;
     int scanned = 0;
 
@@ -906,10 +1099,11 @@ static int scan_elf32(const uint8_t *data, size_t size,
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [-t min_sled] [-w gen_window] [-a] [-G] [-v] file...\n"
+        "Usage: %s [-t min_sled] [-s min_slide] [-w gen_window] [-a] [-G] [-v] file...\n"
         "\n"
         "Options:\n"
         "  -t min_sled     Minimum NOP sled length in bytes, default %d\n"
+        "  -s min_slide    Minimum single-byte slide run, 0 disables, default %d\n"
         "  -w gen_window   Backward search window for generator heuristics, default %d\n"
         "  -a              Scan whole file as raw if ELF region scanning does not apply\n"
         "  -G              Enable extra noisy memset/call sled-generation heuristic\n"
@@ -922,6 +1116,7 @@ static void usage(const char *prog) {
         "  2 = errors or bad usage\n",
         prog,
         DEFAULT_MIN_SLED,
+        DEFAULT_MIN_SEMANTIC,
         DEFAULT_GEN_WINDOW);
 }
 
@@ -1003,6 +1198,8 @@ static int scan_file(const char *path, const Options *opt) {
 int main(int argc, char **argv) {
     Options opt;
     opt.min_sled = DEFAULT_MIN_SLED;
+    opt.min_semantic = DEFAULT_MIN_SEMANTIC;
+    opt.is64 = 1;
     opt.gen_window = DEFAULT_GEN_WINDOW;
     opt.scan_all = 0;
     opt.extra_gen = 0;
@@ -1010,11 +1207,16 @@ int main(int argc, char **argv) {
 
     int c;
 
-    while ((c = getopt(argc, argv, "t:w:aGvh")) != -1) {
+    while ((c = getopt(argc, argv, "t:s:w:aGvh")) != -1) {
         switch (c) {
             case 't':
                 opt.min_sled = atoi(optarg);
                 if (opt.min_sled < 1) opt.min_sled = 1;
+                break;
+
+            case 's':
+                opt.min_semantic = atoi(optarg);
+                if (opt.min_semantic < 0) opt.min_semantic = 0;
                 break;
 
             case 'w':
